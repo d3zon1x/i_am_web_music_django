@@ -44,7 +44,6 @@ def home(request):
     }
 
     if request.method == "POST":
-        # Distinguish forms via a hidden input 'form'
         form_kind = request.POST.get("form")
         if form_kind == "link":
             code = (request.POST.get("link_code") or "").strip()
