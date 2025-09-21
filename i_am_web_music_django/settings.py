@@ -1,4 +1,3 @@
-
 import os
 from pathlib import Path
 
@@ -35,9 +34,13 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'web',
+    'rest_framework',  # added
+    'drf_spectacular',  # added
+    'corsheaders',  # added
 ]
 
 MIDDLEWARE = [
+    'corsheaders.middleware.CorsMiddleware',  # added (must be high)
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -136,11 +139,36 @@ USE_TZ = True
 
 STATIC_URL = 'static/'
 
+# Added REST / Swagger / CORS configuration
+REST_FRAMEWORK = {
+    'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
+    'DEFAULT_AUTHENTICATION_CLASSES': [
+        'rest_framework.authentication.SessionAuthentication',
+    ],
+    'DEFAULT_PERMISSION_CLASSES': [
+        'rest_framework.permissions.AllowAny',  # simple for now
+    ],
+}
+
+SPECTACULAR_SETTINGS = {
+    'TITLE': 'Music Bot API',
+    'DESCRIPTION': 'API for linking Telegram account and requesting song downloads.',
+    'VERSION': '0.1.0',
+    'SERVE_INCLUDE_SCHEMA': False,
+}
+
+CORS_ALLOW_ALL_ORIGINS = True  # development only
+
+# Session settings (ensure React can use session cookie if same-site dev)
+CSRF_TRUSTED_ORIGINS = ['http://localhost:5173', 'http://127.0.0.1:5173']
+SESSION_COOKIE_SAMESITE = 'Lax'
+
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # Bot HTTP bridge config (used by 'web' app to call the Telegram bot)
+# FIX: previously misused env names (base took BOT_HTTP_API_KEY, key took FLASK_API_KEY only)
 BOT_HTTP_API_BASE = os.getenv('BOT_HTTP_API_BASE', 'http://127.0.0.1:5001')
-BOT_HTTP_API_KEY = os.getenv('FLASK_API_KEY', '')
+BOT_HTTP_API_KEY = os.getenv('BOT_HTTP_API_KEY') or os.getenv('FLASK_API_KEY') or 'key123'
