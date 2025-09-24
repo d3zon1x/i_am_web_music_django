@@ -4,14 +4,19 @@ import json
 import logging
 import requests
 import os
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 from django.conf import settings
 from django.http import JsonResponse, HttpRequest
 from django.views.decorators.http import require_http_methods
+from django.utils import timezone
+from django.db import connection
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from drf_spectacular.utils import extend_schema, OpenApiExample, OpenApiParameter, extend_schema_view
+
+from django.db.models import Count, Min, Max
+from .models import History  # Track reachable via History.track
 
 
 def _resolve_api_key() -> str | None:
@@ -101,7 +106,6 @@ def send_song(request):
         return Response({"error": "no linked code (link first)"}, status=400)
     status_code, data = _api_post("/api/send_song_by_code", {"code": code, "query": query})
     if status_code == 200:
-        # Refresh stored code for convenience
         request.session["linked_code"] = code
         return Response({"status": "scheduled"})
     return Response({"error": data.get("error", f"send failed ({status_code})")}, status=400)
@@ -123,7 +127,6 @@ def history(request: HttpRequest):
     return Response({"error": data.get("error", f"history failed ({status_code})")}, status=400)
 
 
-# Replace previous single extend_schema decorator + function for logout with method-specific schema.
 @extend_schema_view(
     get=extend_schema(
         operation_id="logoutSessionGet",
@@ -154,7 +157,6 @@ def logout(request):
         return Response({"status": "not_linked"}, status=200)
 
     status_code, data = _api_post("/api/logout", {"code": code, "source": "web"})
-    # Debug log
     logging.info("WEB logout: code=%s bot_status=%s bot_payload=%s", code, status_code, data)
 
     if status_code == 200:
@@ -178,6 +180,71 @@ def logout(request):
     return Response({"error": data.get("error", f"logout failed ({status_code})"), "detail": data}, status=400)
 
 
+@extend_schema(
+    operation_id="charts",
+    description="Return most downloaded tracks aggregated over a period. period in {week,month,year,all}. Default week. limit default 20 (max 100).",
+    parameters=[
+        OpenApiParameter(name="period", required=False, type=str, description="Aggregation window: week|month|year|all"),
+        OpenApiParameter(name="limit", required=False, type=int, description="Number of tracks to return (1-100)"),
+    ],
+    responses={200: {"type": "object", "properties": {"items": {"type": "array", "items": {"type": "object"}}}}, 400: {"type": "object", "properties": {"error": {"type": "string"}}}},
+    examples=[OpenApiExample("Weekly top 10", value={"items": [{"id": 1, "title": "Track", "downloads": 42}]})]
+)
+@api_view(["GET"])
+def charts(request: HttpRequest):
+    period = (request.GET.get("period") or "week").lower().strip()
+    limit_raw = request.GET.get("limit") or "20"
+    try:
+        limit = max(1, min(100, int(limit_raw)))
+    except ValueError:
+        return Response({"error": "invalid limit"}, status=400)
+
+    days_map = {"week": 7, "month": 30, "year": 365}
+    cutoff = None
+    if period in days_map:
+        cutoff = timezone.now() - timezone.timedelta(days=days_map[period])
+    elif period not in {"all", "*", ""}:
+        return Response({"error": "invalid period"}, status=400)
+
+    qs = History.objects.select_related("track")
+    if cutoff is not None:
+        qs = qs.filter(downloaded_at__gte=cutoff)
+
+    # Aggregate using ORM
+    agg = (
+        qs.values(
+            "track_id",
+            "track__title",
+            "track__artist",
+            "track__youtube_url",
+            "track__thumbnail_url",
+            "track__duration",
+        )
+        .annotate(
+            downloads=Count("id"),
+            first_downloaded=Min("downloaded_at"),
+            last_downloaded=Max("downloaded_at"),
+        )
+        .order_by("-downloads", "-last_downloaded")[:limit]
+    )
+
+    items: List[Dict[str, Any]] = [
+        {
+            "id": row["track_id"],
+            "title": row["track__title"],
+            "artist": row["track__artist"],
+            "youtube_url": row["track__youtube_url"],
+            "thumbnail_url": row["track__thumbnail_url"],
+            "duration": row["track__duration"],
+            "downloads": row["downloads"],
+            "first_downloaded": row["first_downloaded"],
+            "last_downloaded": row["last_downloaded"],
+        }
+        for row in agg
+    ]
+    return Response({"items": items, "period": period, "limit": limit})
+
+
 @require_http_methods(["GET"])
 def root_info(_request: HttpRequest):
     return JsonResponse({
@@ -193,7 +260,6 @@ def root_info(_request: HttpRequest):
     })
 
 
-# Alias view for /logout excluded from schema to avoid operationId collisions
 @extend_schema(exclude=True)
 @api_view(["GET", "POST"])
 def logout_alias(request):
