@@ -1,70 +1,30 @@
+# web/views.py
 from __future__ import annotations
 
-import json
 import logging
-import requests
-import os
 from typing import Dict, Any, List
 
-from django.conf import settings
+from django.utils import timezone
 from django.http import JsonResponse, HttpRequest
 from django.views.decorators.http import require_http_methods
-from django.utils import timezone
-from dotenv import load_dotenv
+from drf_spectacular.utils import extend_schema, OpenApiExample, OpenApiParameter, extend_schema_view
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
-from drf_spectacular.utils import extend_schema, OpenApiExample, OpenApiParameter, extend_schema_view
 
 from django.db.models import Count, Min, Max
-from .models import History, User, Favorite  # Track reachable via related fields
+from .models import History, User, Favorite
 
-load_dotenv()
+from .services.bot_client import BotHttpClient
+from .serializers import LinkRequestSerializer, SendSongRequestSerializer
+from .utils import (
+    set_linked_session,
+    clear_linked_session,
+    get_code_from_request_or_session,
+    normalize_code,
+    parse_limited_int,
+)
 
-def _resolve_api_key() -> str | None:
-    return (
-        getattr(settings, 'BOT_HTTP_API_KEY', None)
-        or getattr(settings, 'FLASK_API_KEY', None)
-        or os.getenv('BOT_HTTP_API_KEY')
-        or os.getenv('FLASK_API_KEY')
-    )
-
-
-def _headers() -> Dict[str, str]:
-    headers = {"Content-Type": "application/json"}
-    api_key = _resolve_api_key()
-    if api_key:
-        headers['X-Api-Key'] = api_key
-    return headers
-
-
-def _api_post(path: str, payload: Dict[str, Any]) -> tuple[int, Dict[str, Any]]:
-    base = getattr(settings, 'BOT_HTTP_API_BASE', 'http://127.0.0.1:5001').rstrip('/')
-    url = f"{base}{path}"
-    try:
-        r = requests.post(url, headers=_headers(), data=json.dumps(payload), timeout=10)
-        try:
-            data = r.json()
-        except Exception:
-            data = {"error": r.text}
-        return r.status_code, data
-    except Exception as e:
-        logging.exception("Failed calling %s", url)
-        return 500, {"error": str(e)}
-
-
-def _api_get(path: str, params: Dict[str, Any]) -> tuple[int, Dict[str, Any]]:
-    base = getattr(settings, 'BOT_HTTP_API_BASE', 'http://127.0.0.1:5001').rstrip('/')
-    url = f"{base}{path}"
-    try:
-        r = requests.get(url, headers=_headers(), params=params, timeout=10)
-        try:
-            data = r.json()
-        except Exception:
-            data = {"error": r.text}
-        return r.status_code, data
-    except Exception as e:
-        logging.exception("Failed calling %s", url)
-        return 500, {"error": str(e)}
+_client = BotHttpClient()
 
 
 @extend_schema(
@@ -75,16 +35,20 @@ def _api_get(path: str, params: Dict[str, Any]) -> tuple[int, Dict[str, Any]]:
     examples=[OpenApiExample("Successful link", value={"code": "12345678"})]
 )
 @api_view(["POST"])
-def link(request):
-    code = (request.data.get("code") if isinstance(request.data, dict) else None) or ""
-    code = str(code).strip()
-    if not code:
+def link(request: HttpRequest):
+    ser = LinkRequestSerializer(data=request.data)
+    if not ser.is_valid():
         return Response({"error": "code required"}, status=400)
-    status_code, data = _api_post("/api/link_by_code", {"code": code})
+    code = normalize_code(ser.validated_data["code"])
+    if not code:
+        return Response({"error": "invalid code"}, status=400)
+
+    status_code, data = _client.link_by_code(code)
     if status_code == 200:
-        request.session["linked"] = True
-        request.session["linked_code"] = code
+        set_linked_session(request, code)
         return Response({"status": "linked", "code": code})
+    if status_code == 401:
+        return Response({"error": "bot unauthorized (check API key)"}, status=502)
     return Response({"error": data.get("error", f"link failed ({status_code})")}, status=400)
 
 
@@ -96,19 +60,25 @@ def link(request):
     examples=[OpenApiExample("Send by session code", value={"query": "Daft Punk Get Lucky"})]
 )
 @api_view(["POST"])
-def send_song(request):
-    query = (request.data.get("query") if isinstance(request.data, dict) else None) or ""
-    code = (request.data.get("code") if isinstance(request.data, dict) else None) or request.session.get("linked_code") or ""
-    query = str(query).strip()
-    code = str(code).strip()
+def send_song(request: HttpRequest):
+    ser = SendSongRequestSerializer(data=request.data)
+    if not ser.is_valid():
+        return Response({"error": "query required"}, status=400)
+    query: str = str(ser.validated_data["query"]).strip()
+    code_input = ser.validated_data.get("code") or request.session.get("linked_code") or ""
+    code = normalize_code(code_input)
     if not query:
         return Response({"error": "query required"}, status=400)
     if not code:
         return Response({"error": "no linked code (link first)"}, status=400)
-    status_code, data = _api_post("/api/send_song_by_code", {"code": code, "query": query})
+
+    status_code, data = _client.send_song_by_code(code, query)
     if status_code == 200:
-        request.session["linked_code"] = code
+        # refresh session code (idempotent)
+        set_linked_session(request, code)
         return Response({"status": "scheduled"})
+    if status_code == 401:
+        return Response({"error": "bot unauthorized (check API key)"}, status=502)
     return Response({"error": data.get("error", f"send failed ({status_code})")}, status=400)
 
 
@@ -119,24 +89,19 @@ def send_song(request):
     description="Return recent download history for the linked Telegram user from local DB (no bot HTTP call).")
 @api_view(["GET"])
 def history(request: HttpRequest):
-    code = request.GET.get("code") or request.session.get("linked_code") or ""
-    code = str(code).strip()
+    code = normalize_code(request.GET.get("code") or request.session.get("linked_code") or "")
     if not code:
         return Response({"error": "no linked code"}, status=400)
-    if not code.isdigit():
-        return Response({"error": "invalid code"}, status=400)
 
-    # Resolve Telegram user_id by website_link_code using ORM (BotUser unmanaged model)
     try:
         user_id = User.objects.filter(website_link_code=int(code)).values_list("id", flat=True).first()
     except Exception as e:
-        logging.exception("history: failed to resolve user by code using ORM")
+        logging.exception("history: ORM lookup failed")
         return Response({"error": "history unavailable", "detail": str(e)}, status=400)
 
     if not user_id:
         return Response({"error": "code not found"}, status=400)
 
-    # Fetch recent history for this user; cap to a reasonable window
     qs = (
         History.objects
         .select_related("track")
@@ -144,18 +109,15 @@ def history(request: HttpRequest):
         .order_by("-downloaded_at")[:200]
     )
 
-    items: List[Dict[str, Any]] = []
-    for h in qs:
-        t = h.track
-        items.append({
-            "id": t.id,
-            "title": t.title,
-            "artist": t.artist,
-            "youtube_url": t.youtube_url,
-            "thumbnail_url": t.thumbnail_url,
-            "duration": t.duration,
-            "downloaded_at": h.downloaded_at,
-        })
+    items: List[Dict[str, Any]] = [{
+        "id": h.track.id,
+        "title": h.track.title,
+        "artist": h.track.artist,
+        "youtube_url": h.track.youtube_url,
+        "thumbnail_url": h.track.thumbnail_url,
+        "duration": h.track.duration,
+        "downloaded_at": h.downloaded_at,
+    } for h in qs]
 
     return Response({"items": items})
 
@@ -175,41 +137,26 @@ def history(request: HttpRequest):
     ),
 )
 @api_view(["POST", "GET"])
-def logout(request):
-    if request.method == "GET":
-        code = request.GET.get("code") or request.session.get("linked_code") or ""
-    else:
-        body_code = (request.data.get("code") if isinstance(request.data, dict) else None)
-        code = body_code or request.GET.get("code") or request.session.get("linked_code") or ""
-    code = str(code).strip()
-    if code and not code.isdigit():
-        code = ""
+def logout(request: HttpRequest):
+    code_raw = get_code_from_request_or_session(request)
+    code = normalize_code(code_raw)
     if not code:
-        request.session.pop("linked", None)
-        request.session.pop("linked_code", None)
+        clear_linked_session(request)
         return Response({"status": "not_linked"}, status=200)
 
-    status_code, data = _api_post("/api/logout", {"code": code, "source": "web"})
+    status_code, data = _client.logout_by_code(code)
     logging.info("WEB logout: code=%s bot_status=%s bot_payload=%s", code, status_code, data)
 
     if status_code == 200:
-        request.session.pop("linked", None)
-        request.session.pop("linked_code", None)
+        clear_linked_session(request)
         return Response({"status": "logged_out"})
     if data.get("error") in {"code not found", "user not found", "invalid code", "user_id or code required"}:
-        request.session.pop("linked", None)
-        request.session.pop("linked_code", None)
+        clear_linked_session(request)
         return Response({"status": "not_linked"}, status=200)
     if status_code == 401:
-        expected = _resolve_api_key()
-        return Response({
-            "error": "bot unauthorized (check API key)",
-            "hint": "Ensure Django and bot use the same key in X-Api-Key header.",
-            "expected_key_present": bool(expected),
-        }, status=502)
+        return Response({"error": "bot unauthorized (check API key)"}, status=502)
     if 500 <= status_code < 600:
         return Response({"error": "bot service error", "detail": data.get("error")}, status=502)
-    # Fallback
     return Response({"error": data.get("error", f"logout failed ({status_code})"), "detail": data}, status=400)
 
 
@@ -226,10 +173,8 @@ def logout(request):
 @api_view(["GET"])
 def charts(request: HttpRequest):
     period = (request.GET.get("period") or "week").lower().strip()
-    limit_raw = request.GET.get("limit") or "20"
-    try:
-        limit = max(1, min(100, int(limit_raw)))
-    except ValueError:
+    limit = parse_limited_int(request.GET.get("limit") or "20", default=20, min_v=1, max_v=100)
+    if limit is None:
         return Response({"error": "invalid limit"}, status=400)
 
     days_map = {"week": 7, "month": 30, "year": 365}
@@ -243,7 +188,6 @@ def charts(request: HttpRequest):
     if cutoff is not None:
         qs = qs.filter(downloaded_at__gte=cutoff)
 
-    # Aggregate using ORM
     agg = (
         qs.values(
             "track_id",
@@ -289,23 +233,18 @@ def charts(request: HttpRequest):
 )
 @api_view(["GET"])
 def favorites(request: HttpRequest):
-    code = request.GET.get("code") or request.session.get("linked_code") or ""
-    code = str(code).strip()
+    code = normalize_code(request.GET.get("code") or request.session.get("linked_code") or "")
     if not code:
         return Response({"error": "no linked code"}, status=400)
-    if not code.isdigit():
-        return Response({"error": "invalid code"}, status=400)
 
-    limit_raw = request.GET.get("limit") or "500"
-    try:
-        limit = max(1, min(1000, int(limit_raw)))
-    except ValueError:
+    limit = parse_limited_int(request.GET.get("limit") or "500", default=500, min_v=1, max_v=1000)
+    if limit is None:
         return Response({"error": "invalid limit"}, status=400)
 
     try:
         user_id = User.objects.filter(website_link_code=int(code)).values_list("id", flat=True).first()
     except Exception as e:
-        logging.exception("favorites: failed to resolve user by code using ORM")
+        logging.exception("favorites: ORM lookup failed")
         return Response({"error": "favorites unavailable", "detail": str(e)}, status=400)
 
     if not user_id:
@@ -318,17 +257,14 @@ def favorites(request: HttpRequest):
         .order_by("-id")[:limit]
     )
 
-    items: List[Dict[str, Any]] = []
-    for f in qs:
-        t = f.track
-        items.append({
-            "id": t.id,
-            "title": t.title,
-            "artist": t.artist,
-            "youtube_url": t.youtube_url,
-            "thumbnail_url": t.thumbnail_url,
-            "duration": t.duration,
-        })
+    items: List[Dict[str, Any]] = [{
+        "id": f.track.id,
+        "title": f.track.title,
+        "artist": f.track.artist,
+        "youtube_url": f.track.youtube_url,
+        "thumbnail_url": f.track.thumbnail_url,
+        "duration": f.track.duration,
+    } for f in qs]
 
     return Response({"items": items, "limit": limit})
 
@@ -346,8 +282,7 @@ def favorites(request: HttpRequest):
 )
 @api_view(["GET"])
 def get_user_by_token(request: HttpRequest):
-    token = request.GET.get("token") or request.GET.get("code") or ""
-    token = str(token).strip()
+    token = (request.GET.get("token") or request.GET.get("code") or "").strip()
     if not token:
         return Response({"error": "token required"}, status=400)
     if not token.isdigit():
@@ -361,7 +296,7 @@ def get_user_by_token(request: HttpRequest):
             .first()
         )
     except Exception as e:
-        logging.exception("get_user_by_token: failed to query user")
+        logging.exception("get_user_by_token: ORM lookup failed")
         return Response({"error": "lookup failed", "detail": str(e)}, status=400)
 
     if not user:
@@ -375,19 +310,13 @@ def root_info(_request: HttpRequest):
     return JsonResponse({
         "message": "Music Bot API",
         "endpoints": {
-            "POST /api/link": "Link session with Telegram code",
-            "POST /api/send": "Send song query to Telegram",
-            "POST /api/logout": "Logout linked session (also GET /api/logout for session-only)",
-            "GET /api/history": "Download history",
-            "GET /api/favorites": "Favorite tracks",
-            "GET /api/user_by_token": "Resolve user by link token",
-            "GET /api/schema/": "OpenAPI schema",
-            "GET /api/docs/": "Swagger UI",
+                "POST /api/link": "Link session with Telegram code",
+                "POST /api/send": "Send song query to Telegram",
+                "POST /api/logout": "Logout linked session (also GET /api/logout for session-only)",
+                "GET /api/history": "Download history",
+                "GET /api/favorites": "Favorite tracks",
+                "GET /api/user_by_token": "Resolve user by link token",
+                "GET /api/schema/": "OpenAPI schema",
+                "GET /api/docs/": "Swagger UI",
         }
     })
-
-
-@extend_schema(exclude=True)
-@api_view(["GET", "POST"])
-def logout_alias(request):
-    return logout(request)

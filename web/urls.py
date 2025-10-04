@@ -1,6 +1,6 @@
 from django.urls import path
 from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView
-from .views import root_info, link, send_song, history, logout, logout_alias, charts, favorites, get_user_by_token
+from .views import root_info, link, send_song, history, logout, charts, favorites, get_user_by_token
 
 urlpatterns = [
     path('', root_info, name='root-info'),
