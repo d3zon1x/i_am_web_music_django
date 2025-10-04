@@ -10,14 +10,15 @@ from django.conf import settings
 from django.http import JsonResponse, HttpRequest
 from django.views.decorators.http import require_http_methods
 from django.utils import timezone
-from django.db import connection
+from dotenv import load_dotenv
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from drf_spectacular.utils import extend_schema, OpenApiExample, OpenApiParameter, extend_schema_view
 
 from django.db.models import Count, Min, Max
-from .models import History  # Track reachable via History.track
+from .models import History, User, Favorite  # Track reachable via related fields
 
+load_dotenv()
 
 def _resolve_api_key() -> str | None:
     return (
@@ -115,16 +116,48 @@ def send_song(request):
     operation_id="downloadHistory",
     parameters=[OpenApiParameter(name="code", description="Optional code; if omitted uses linked session code", required=False, type=str)],
     responses={200: {"type": "object", "properties": {"items": {"type": "array", "items": {"type": "object"}}}}, 400: {"type": "object", "properties": {"error": {"type": "string"}}}},
-    description="Return recent download history for the linked Telegram user. This delegates to the bot service.")
+    description="Return recent download history for the linked Telegram user from local DB (no bot HTTP call).")
 @api_view(["GET"])
 def history(request: HttpRequest):
     code = request.GET.get("code") or request.session.get("linked_code") or ""
+    code = str(code).strip()
     if not code:
         return Response({"error": "no linked code"}, status=400)
-    status_code, data = _api_get("/api/history_by_code", {"code": code})
-    if status_code == 200:
-        return Response({"items": data.get("items", data.get("history", []))})
-    return Response({"error": data.get("error", f"history failed ({status_code})")}, status=400)
+    if not code.isdigit():
+        return Response({"error": "invalid code"}, status=400)
+
+    # Resolve Telegram user_id by website_link_code using ORM (BotUser unmanaged model)
+    try:
+        user_id = User.objects.filter(website_link_code=int(code)).values_list("id", flat=True).first()
+    except Exception as e:
+        logging.exception("history: failed to resolve user by code using ORM")
+        return Response({"error": "history unavailable", "detail": str(e)}, status=400)
+
+    if not user_id:
+        return Response({"error": "code not found"}, status=400)
+
+    # Fetch recent history for this user; cap to a reasonable window
+    qs = (
+        History.objects
+        .select_related("track")
+        .filter(user_id=user_id)
+        .order_by("-downloaded_at")[:200]
+    )
+
+    items: List[Dict[str, Any]] = []
+    for h in qs:
+        t = h.track
+        items.append({
+            "id": t.id,
+            "title": t.title,
+            "artist": t.artist,
+            "youtube_url": t.youtube_url,
+            "thumbnail_url": t.thumbnail_url,
+            "duration": t.duration,
+            "downloaded_at": h.downloaded_at,
+        })
+
+    return Response({"items": items})
 
 
 @extend_schema_view(
@@ -245,6 +278,98 @@ def charts(request: HttpRequest):
     return Response({"items": items, "period": period, "limit": limit})
 
 
+@extend_schema(
+    operation_id="favorites",
+    description="Return favorite tracks for the linked Telegram user from local DB (no bot HTTP call).",
+    parameters=[
+        OpenApiParameter(name="code", description="Optional code; if omitted uses linked session code", required=False, type=str),
+        OpenApiParameter(name="limit", description="Optional limit of items to return (1-1000). Default 500.", required=False, type=int),
+    ],
+    responses={200: {"type": "object", "properties": {"items": {"type": "array", "items": {"type": "object"}}}}, 400: {"type": "object", "properties": {"error": {"type": "string"}}}},
+)
+@api_view(["GET"])
+def favorites(request: HttpRequest):
+    code = request.GET.get("code") or request.session.get("linked_code") or ""
+    code = str(code).strip()
+    if not code:
+        return Response({"error": "no linked code"}, status=400)
+    if not code.isdigit():
+        return Response({"error": "invalid code"}, status=400)
+
+    limit_raw = request.GET.get("limit") or "500"
+    try:
+        limit = max(1, min(1000, int(limit_raw)))
+    except ValueError:
+        return Response({"error": "invalid limit"}, status=400)
+
+    try:
+        user_id = User.objects.filter(website_link_code=int(code)).values_list("id", flat=True).first()
+    except Exception as e:
+        logging.exception("favorites: failed to resolve user by code using ORM")
+        return Response({"error": "favorites unavailable", "detail": str(e)}, status=400)
+
+    if not user_id:
+        return Response({"error": "code not found"}, status=400)
+
+    qs = (
+        Favorite.objects
+        .select_related("track")
+        .filter(user_id=user_id)
+        .order_by("-id")[:limit]
+    )
+
+    items: List[Dict[str, Any]] = []
+    for f in qs:
+        t = f.track
+        items.append({
+            "id": t.id,
+            "title": t.title,
+            "artist": t.artist,
+            "youtube_url": t.youtube_url,
+            "thumbnail_url": t.thumbnail_url,
+            "duration": t.duration,
+        })
+
+    return Response({"items": items, "limit": limit})
+
+
+@extend_schema(
+    operation_id="getUserByToken",
+    description="Resolve a Telegram user by website link token (numeric code). Returns basic user info.",
+    parameters=[OpenApiParameter(name="token", description="Link token/code shown by the bot", required=True, type=str)],
+    responses={
+        200: {"type": "object", "properties": {"user": {"type": "object"}}},
+        400: {"type": "object", "properties": {"error": {"type": "string"}}},
+        404: {"type": "object", "properties": {"error": {"type": "string"}}},
+    },
+    examples=[OpenApiExample("Found", value={"user": {"id": 123456789, "username": "john", "first_name": "John", "last_name": "Doe", "website_linked": "true"}})],
+)
+@api_view(["GET"])
+def get_user_by_token(request: HttpRequest):
+    token = request.GET.get("token") or request.GET.get("code") or ""
+    token = str(token).strip()
+    if not token:
+        return Response({"error": "token required"}, status=400)
+    if not token.isdigit():
+        return Response({"error": "invalid token"}, status=400)
+
+    try:
+        user = (
+            User.objects
+            .filter(website_link_code=int(token))
+            .values("id", "username", "first_name", "last_name", "website_linked", "created_at")
+            .first()
+        )
+    except Exception as e:
+        logging.exception("get_user_by_token: failed to query user")
+        return Response({"error": "lookup failed", "detail": str(e)}, status=400)
+
+    if not user:
+        return Response({"error": "user not found"}, status=404)
+
+    return Response({"user": user})
+
+
 @require_http_methods(["GET"])
 def root_info(_request: HttpRequest):
     return JsonResponse({
@@ -254,6 +379,8 @@ def root_info(_request: HttpRequest):
             "POST /api/send": "Send song query to Telegram",
             "POST /api/logout": "Logout linked session (also GET /api/logout for session-only)",
             "GET /api/history": "Download history",
+            "GET /api/favorites": "Favorite tracks",
+            "GET /api/user_by_token": "Resolve user by link token",
             "GET /api/schema/": "OpenAPI schema",
             "GET /api/docs/": "Swagger UI",
         }

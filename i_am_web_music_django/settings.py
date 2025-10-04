@@ -1,15 +1,10 @@
 import os
 from pathlib import Path
+from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-try:
-    from dotenv import load_dotenv  # type: ignore
-    bot_env = (BASE_DIR.parent / '.env')
-    if bot_env.exists():
-        load_dotenv(bot_env)
-except Exception:
-    pass
+
 
 
 # Quick-start development settings - unsuitable for production
@@ -34,9 +29,9 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'web',
-    'rest_framework',  # added
-    'drf_spectacular',  # added
-    'corsheaders',  # added
+    'rest_framework',
+    'drf_spectacular',
+    'corsheaders',
 ]
 
 MIDDLEWARE = [
@@ -72,6 +67,8 @@ WSGI_APPLICATION = 'i_am_web_music_django.wsgi.application'
 
 # Database
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
+
+load_dotenv()
 
 PG_USER = os.getenv('PG_USER')
 PG_PASSWORD = os.getenv('PG_PASSWORD')
